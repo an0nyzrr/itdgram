@@ -22,7 +22,7 @@ from itdpy.client import ITDClient
 # CONFIG
 # =========================
 
-BOT_TOKEN = "8674340378:AAEUej6usFnQhLfzQ5Tf_oI7lGk2ShmvkVQ"
+BOT_TOKEN = ""
 ADMIN_ID = 7544522231
 
 bot = Bot(token=BOT_TOKEN)
