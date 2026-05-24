@@ -1,5 +1,6 @@
 import asyncio
 import aiosqlite
+import os
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
@@ -22,7 +23,7 @@ from itdpy.client import ITDClient
 # CONFIG
 # =========================
 
-BOT_TOKEN = ""
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = 7544522231
 
 bot = Bot(token=BOT_TOKEN)
