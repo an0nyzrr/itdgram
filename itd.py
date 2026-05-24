@@ -1,17 +1,19 @@
+import os
 import asyncio
 import aiosqlite
-import os
+
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message,
     CallbackQuery,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
     InlineKeyboardMarkup,
-    InlineKeyboardButton
+    InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+    KeyboardButton
 )
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import State, StatesGroup
@@ -19,25 +21,33 @@ from aiogram.fsm.state import State, StatesGroup
 from itdpy.client import ITDClient
 
 
-# =========================
+# =====================================
 # CONFIG
-# =========================
+# =====================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN not found")
+
 ADMIN_ID = 7544522231
 
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
+
+dp = Dispatcher(
+    storage=MemoryStorage()
+)
 
 DB = "itd.db"
 
 user_feeds = {}
 verified_users = set()
+live_tasks = {}
 
 
-# =========================
-# DB
-# =========================
+# =====================================
+# DATABASE
+# =====================================
 
 async def init_db():
 
@@ -49,6 +59,35 @@ async def init_db():
             refresh_token TEXT
         )
         """)
+
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS verified (
+            username TEXT PRIMARY KEY
+        )
+        """)
+
+        await db.commit()
+
+        async with db.execute(
+            "SELECT username FROM verified"
+        ) as cur:
+
+            rows = await cur.fetchall()
+
+            for row in rows:
+                verified_users.add(row[0].lower())
+
+
+async def save_verified(username):
+
+    verified_users.add(username.lower())
+
+    async with aiosqlite.connect(DB) as db:
+
+        await db.execute(
+            "INSERT OR REPLACE INTO verified VALUES (?)",
+            (username.lower(),)
+        )
 
         await db.commit()
 
@@ -89,20 +128,9 @@ async def delete_session(tg_id):
         await db.commit()
 
 
-async def get_all_users():
-
-    async with aiosqlite.connect(DB) as db:
-
-        async with db.execute(
-            "SELECT telegram_id FROM sessions"
-        ) as cur:
-
-            return await cur.fetchall()
-
-
-# =========================
+# =====================================
 # STATES
-# =========================
+# =====================================
 
 class LoginState(StatesGroup):
     token = State()
@@ -116,60 +144,66 @@ class CommentState(StatesGroup):
     text = State()
 
 
-class AdminState(StatesGroup):
-    verify = State()
-    broadcast = State()
+class BroadcastState(StatesGroup):
+    text = State()
 
 
-# =========================
-# HELPERS
-# =========================
-
-def is_admin(uid):
-    return uid == ADMIN_ID
+class VerifyState(StatesGroup):
+    text = State()
 
 
-def menu(uid):
+# =====================================
+# KEYBOARDS
+# =====================================
 
-    kb = [
+menu = ReplyKeyboardMarkup(
+    keyboard=[
         [
             KeyboardButton(text="🏠 Лента"),
-            KeyboardButton(text="👤 Профиль")
+            KeyboardButton(text="🔔 Уведомления")
         ],
         [
             KeyboardButton(text="📝 Пост"),
-            KeyboardButton(text="🔔 Уведомления")
+            KeyboardButton(text="👤 Профиль")
         ],
         [
             KeyboardButton(text="🔎 Поиск"),
             KeyboardButton(text="🚪 Выйти")
         ]
-    ]
-
-    if is_admin(uid):
-        kb.append([
-            KeyboardButton(text="/admin")
-        ])
-
-    return ReplyKeyboardMarkup(
-        keyboard=kb,
-        resize_keyboard=True
-    )
+    ],
+    resize_keyboard=True
+)
 
 
-def feed_kb(i, post_id):
+admin_menu = ReplyKeyboardMarkup(
+    keyboard=[
+        [
+            KeyboardButton(text="📊 Стата"),
+            KeyboardButton(text="📢 Рассылка")
+        ],
+        [
+            KeyboardButton(text="✔ Выдать галочку")
+        ],
+        [
+            KeyboardButton(text="🔙 Назад")
+        ]
+    ],
+    resize_keyboard=True
+)
+
+
+def feed_kb(index, post_id):
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
                     text="⬅️",
-                    callback_data=f"prev:{i}"
+                    callback_data=f"prev:{index}"
                 ),
-
                 InlineKeyboardButton(
                     text="➡️",
-                    callback_data=f"next:{i}"
+                    callback_data=f"next:{index}"
                 )
             ],
             [
@@ -177,7 +211,6 @@ def feed_kb(i, post_id):
                     text="❤️",
                     callback_data=f"like:{post_id}"
                 ),
-
                 InlineKeyboardButton(
                     text="💬",
                     callback_data=f"comment:{post_id}"
@@ -186,6 +219,10 @@ def feed_kb(i, post_id):
         ]
     )
 
+
+# =====================================
+# CLIENT
+# =====================================
 
 async def get_client(tg_id):
 
@@ -199,9 +236,13 @@ async def get_client(tg_id):
     )
 
 
-def badge(username):
+# =====================================
+# HELPERS
+# =====================================
 
-    if username in verified_users:
+def verify_mark(username):
+
+    if username.lower() in verified_users:
         return " ✔"
 
     return ""
@@ -219,50 +260,65 @@ def render(post):
     likes = getattr(post, "likes_count", 0)
     comments = getattr(post, "comments_count", 0)
 
-    return f"""👤 {username}{badge(username)}
+    return f"""👤 {username}{verify_mark(username)}
 
 {content}
 
 ❤️ {likes} | 💬 {comments}"""
 
 
-def extract_media(post):
+def notif_text(n):
+
+    try:
+        actor = getattr(n, "actor", None)
+
+        username = "unknown"
+
+        if actor:
+            username = getattr(actor, "username", "unknown")
+
+        ntype = str(
+            getattr(n, "type", "")
+        ).lower()
+
+        if "follow" in ntype:
+            return f"👤 {username} подписался(-лась) на вас"
+
+        if "like" in ntype:
+            return f"❤️ {username} лайкнул ваш пост"
+
+        if "comment" in ntype:
+            return f"💬 {username} прокомментировал ваш пост"
+
+        return f"🔔 {username}: {ntype}"
+
+    except:
+        return "🔔 Новое уведомление"
+
+
+def get_post_photo(post):
 
     try:
 
-        attachments = getattr(post, "attachments", None)
+        attachments = getattr(post, "attachments", [])
 
-        if attachments:
+        if not attachments:
+            return None
 
-            for a in attachments:
+        for a in attachments:
 
-                for field in [
-                    "url",
-                    "fileUrl",
-                    "imageUrl",
-                    "previewUrl"
-                ]:
+            url = getattr(a, "url", None)
 
-                    value = getattr(a, field, None)
+            if url and url.startswith("http"):
+                return url
 
-                    if isinstance(value, str):
+            file = getattr(a, "file", None)
 
-                        if value.startswith("http"):
-                            return value
+            if file:
+                file_url = getattr(file, "url", None)
 
-        for field in [
-            "imageUrl",
-            "fileUrl",
-            "previewUrl",
-            "url"
-        ]:
-
-            value = getattr(post, field, None)
-
-            if isinstance(value, str):
-
-                if value.startswith("http"):
-                    return value
+                if file_url and file_url.startswith("http"):
+                    return file_url
 
     except:
         pass
@@ -270,44 +326,205 @@ def extract_media(post):
     return None
 
 
-async def safe_send(msg, media, text, kb):
+# =====================================
+# START
+# =====================================
 
-    if media:
+@dp.message(CommandStart())
+async def start(msg: Message, state: FSMContext):
+
+    await state.set_state(
+        LoginState.token
+    )
+
+    await msg.answer(
+"""Отправь refresh_token ITD
+
+Как получить:
+
+1. itd.com
+2. F12
+3. Application
+4. Cookies
+5. refresh_token"""
+    )
+
+
+# =====================================
+# HELP
+# =====================================
+
+@dp.message(F.text == "/help")
+async def help_cmd(msg: Message):
+
+    await msg.answer(
+"""ИТДграм — это соцсеть ITD внутри Telegram.
+
+✔ — галочка верификации внутри ИТДграма.
+Выдается админом.
+
+Команды:
+🏠 Лента
+🔔 Уведомления
+📝 Пост
+👤 Профиль
+🔎 Поиск"""
+    )
+
+
+# =====================================
+# ADMIN
+# =====================================
+
+@dp.message(F.text == "/admin")
+async def admin(msg: Message):
+
+    if msg.from_user.id != ADMIN_ID:
+        return await msg.answer(
+            "❌ Ты не админ"
+        )
+
+    await msg.answer(
+        "⚙ Админка",
+        reply_markup=admin_menu
+    )
+
+
+@dp.message(F.text == "🔙 Назад")
+async def back(msg: Message):
+
+    await msg.answer(
+        "🏠 Главное меню",
+        reply_markup=menu
+    )
+
+
+@dp.message(F.text == "📊 Стата")
+async def stats(msg: Message):
+
+    if msg.from_user.id != ADMIN_ID:
+        return
+
+    async with aiosqlite.connect(DB) as db:
+
+        async with db.execute(
+            "SELECT COUNT(*) FROM sessions"
+        ) as cur:
+
+            users = (await cur.fetchone())[0]
+
+    await msg.answer(
+        f"👥 Пользователей: {users}\n✔ Верифов: {len(verified_users)}"
+    )
+
+
+@dp.message(F.text == "📢 Рассылка")
+async def mailing(msg: Message, state: FSMContext):
+
+    if msg.from_user.id != ADMIN_ID:
+        return
+
+    await state.set_state(
+        BroadcastState.text
+    )
+
+    await msg.answer(
+        "Введите текст рассылки"
+    )
+
+
+@dp.message(BroadcastState.text)
+async def send_broadcast(msg: Message, state: FSMContext):
+
+    if msg.from_user.id != ADMIN_ID:
+        return
+
+    sent = 0
+
+    async with aiosqlite.connect(DB) as db:
+
+        async with db.execute(
+            "SELECT telegram_id FROM sessions"
+        ) as cur:
+
+            users = await cur.fetchall()
+
+    for u in users:
 
         try:
 
-            return await msg.answer_photo(
-                media,
-                caption=text,
-                reply_markup=kb
+            await bot.send_message(
+                u[0],
+                f"📢 {msg.text}"
+            )
+
+            sent += 1
+
+        except:
+            pass
+
+    await msg.answer(
+        f"✅ Отправлено: {sent}"
+    )
+
+    await state.clear()
+
+
+@dp.message(F.text == "✔ Выдать галочку")
+async def verify_start(msg: Message, state: FSMContext):
+
+    if msg.from_user.id != ADMIN_ID:
+        return
+
+    await state.set_state(
+        VerifyState.text
+    )
+
+    await msg.answer(
+        "Введите username ITD"
+    )
+
+
+@dp.message(VerifyState.text)
+async def verify_user(msg: Message, state: FSMContext):
+
+    if msg.from_user.id != ADMIN_ID:
+        return
+
+    username = msg.text.replace("@", "").strip()
+
+    await save_verified(username)
+
+    async with aiosqlite.connect(DB) as db:
+
+        async with db.execute(
+            "SELECT telegram_id FROM sessions"
+        ) as cur:
+
+            users = await cur.fetchall()
+
+    for u in users:
+
+        try:
+
+            await bot.send_message(
+                u[0],
+                f'✔ Верифицирован!\n\nПользователь "{username}" получил галочку в ИТДграме!'
             )
 
         except:
             pass
 
-    return await msg.answer(
-        text,
-        reply_markup=kb
-    )
-
-
-# =========================
-# START
-# =========================
-
-@dp.message(CommandStart())
-async def start(msg: Message, state: FSMContext):
-
-    await state.set_state(LoginState.token)
-
     await msg.answer(
-        "Отправь refresh_token ITD"
+        f"✔ Галочка выдана @{username}"
     )
 
+    await state.clear()
 
-# =========================
+
+# =====================================
 # LOGIN
-# =========================
+# =====================================
 
 @dp.message(LoginState.token)
 async def login(msg: Message, state: FSMContext):
@@ -328,8 +545,8 @@ async def login(msg: Message, state: FSMContext):
         )
 
         await msg.answer(
-            f"✅ Вход выполнен\n👤 {me.username}",
-            reply_markup=menu(msg.from_user.id)
+            f"✅ Вход выполнен\n\n👤 {me.username}",
+            reply_markup=menu
         )
 
         await state.clear()
@@ -339,165 +556,9 @@ async def login(msg: Message, state: FSMContext):
         await msg.answer(str(e))
 
 
-# =========================
-# ADMIN
-# =========================
-
-@dp.message(Command("admin"))
-async def admin(msg: Message):
-
-    if not is_admin(msg.from_user.id):
-        return await msg.answer("⛔ Нет доступа")
-
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="📊 Стата",
-                    callback_data="admin:stats"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="✔ Выдать галочку",
-                    callback_data="admin:verify"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📣 Рассылка",
-                    callback_data="admin:broadcast"
-                )
-            ]
-        ]
-    )
-
-    await msg.answer(
-        "🛠 Админ-панель",
-        reply_markup=kb
-    )
-
-
-@dp.callback_query(F.data == "admin:stats")
-async def admin_stats(c: CallbackQuery):
-
-    if not is_admin(c.from_user.id):
-        return
-
-    users = await get_all_users()
-
-    await c.message.answer(
-        f"📊 Пользователей: {len(users)}"
-    )
-
-    await c.answer()
-
-
-@dp.callback_query(F.data == "admin:verify")
-async def admin_verify(
-    c: CallbackQuery,
-    state: FSMContext
-):
-
-    if not is_admin(c.from_user.id):
-        return
-
-    await state.set_state(
-        AdminState.verify
-    )
-
-    await c.message.answer(
-        "Отправь username"
-    )
-
-    await c.answer()
-
-
-@dp.message(AdminState.verify)
-async def verify_user(
-    msg: Message,
-    state: FSMContext
-):
-
-    username = msg.text.strip().replace("@", "")
-
-    verified_users.add(username)
-
-    users = await get_all_users()
-
-    for u in users:
-
-        try:
-
-            await bot.send_message(
-                u[0],
-                f'🎉 Верифицирован! ✔\n\nПользователь "{username}" получил галочку в ИТДграме!'
-            )
-
-        except:
-            pass
-
-    await msg.answer(
-        f"✔ @{username} верифицирован"
-    )
-
-    await state.clear()
-
-
-@dp.callback_query(F.data == "admin:broadcast")
-async def admin_broadcast(
-    c: CallbackQuery,
-    state: FSMContext
-):
-
-    if not is_admin(c.from_user.id):
-        return
-
-    await state.set_state(
-        AdminState.broadcast
-    )
-
-    await c.message.answer(
-        "Отправь текст рассылки"
-    )
-
-    await c.answer()
-
-
-@dp.message(AdminState.broadcast)
-async def send_broadcast(
-    msg: Message,
-    state: FSMContext
-):
-
-    users = await get_all_users()
-
-    sent = 0
-
-    for u in users:
-
-        try:
-
-            await bot.send_message(
-                u[0],
-                msg.text
-            )
-
-            sent += 1
-
-        except:
-            pass
-
-    await msg.answer(
-        f"📣 Отправлено: {sent}"
-    )
-
-    await state.clear()
-
-
-# =========================
+# =====================================
 # FEED
-# =========================
+# =====================================
 
 @dp.message(F.text == "🏠 Лента")
 async def feed(msg: Message):
@@ -520,18 +581,60 @@ async def feed(msg: Message):
 
         post = posts[0]
 
-        media = extract_media(post)
+        media = get_post_photo(post)
 
-        await safe_send(
-            msg,
-            media,
+        if media:
+
+            try:
+
+                await msg.answer_photo(
+                    media,
+                    caption=render(post),
+                    reply_markup=feed_kb(0, post.id)
+                )
+
+                return
+
+            except:
+                pass
+
+        await msg.answer(
             render(post),
-            feed_kb(0, post.id)
+            reply_markup=feed_kb(0, post.id)
         )
 
     except Exception as e:
 
         await msg.answer(str(e))
+
+
+# =====================================
+# NEXT/PREV
+# =====================================
+
+async def send_post(message, post, index):
+
+    media = get_post_photo(post)
+
+    if media:
+
+        try:
+
+            await message.answer_photo(
+                media,
+                caption=render(post),
+                reply_markup=feed_kb(index, post.id)
+            )
+
+            return
+
+        except:
+            pass
+
+    await message.answer(
+        render(post),
+        reply_markup=feed_kb(index, post.id)
+    )
 
 
 @dp.callback_query(F.data.startswith("next:"))
@@ -542,24 +645,15 @@ async def next_post(c: CallbackQuery):
     if not posts:
         return
 
-    i = int(c.data.split(":")[1])
-
-    i += 1
+    i = int(c.data.split(":")[1]) + 1
 
     if i >= len(posts):
         i = 0
 
-    post = posts[i]
-
-    media = extract_media(post)
-
-    await c.message.delete()
-
-    await safe_send(
+    await send_post(
         c.message,
-        media,
-        render(post),
-        feed_kb(i, post.id)
+        posts[i],
+        i
     )
 
     await c.answer()
@@ -573,32 +667,23 @@ async def prev_post(c: CallbackQuery):
     if not posts:
         return
 
-    i = int(c.data.split(":")[1])
-
-    i -= 1
+    i = int(c.data.split(":")[1]) - 1
 
     if i < 0:
         i = len(posts) - 1
 
-    post = posts[i]
-
-    media = extract_media(post)
-
-    await c.message.delete()
-
-    await safe_send(
+    await send_post(
         c.message,
-        media,
-        render(post),
-        feed_kb(i, post.id)
+        posts[i],
+        i
     )
 
     await c.answer()
 
 
-# =========================
+# =====================================
 # LIKE
-# =========================
+# =====================================
 
 @dp.callback_query(F.data.startswith("like:"))
 async def like(c: CallbackQuery):
@@ -613,14 +698,14 @@ async def like(c: CallbackQuery):
 
         await c.answer("❤️")
 
-    except:
+    except Exception as e:
 
-        await c.answer("Ошибка")
+        await c.answer(str(e))
 
 
-# =========================
+# =====================================
 # COMMENT
-# =========================
+# =====================================
 
 @dp.callback_query(F.data.startswith("comment:"))
 async def comment_open(
@@ -628,14 +713,12 @@ async def comment_open(
     state: FSMContext
 ):
 
-    post_id = c.data.split(":")[1]
-
     await state.set_state(
         CommentState.text
     )
 
     await state.update_data(
-        post_id=post_id
+        post_id=c.data.split(":")[1]
     )
 
     await c.message.answer(
@@ -651,9 +734,9 @@ async def comment_send(
     state: FSMContext
 ):
 
-    data = await state.get_data()
-
     client = await get_client(msg.from_user.id)
+
+    data = await state.get_data()
 
     try:
 
@@ -671,9 +754,9 @@ async def comment_send(
     await state.clear()
 
 
-# =========================
+# =====================================
 # PROFILE
-# =========================
+# =====================================
 
 @dp.message(F.text == "👤 Профиль")
 async def profile(msg: Message):
@@ -688,7 +771,7 @@ async def profile(msg: Message):
         me = client.users.me()
 
         await msg.answer(
-            f"👤 {me.username}{badge(me.username)}\n🆔 {me.id}"
+            f"👤 {me.username}{verify_mark(me.username)}\n🆔 {me.id}"
         )
 
     except Exception as e:
@@ -696,11 +779,11 @@ async def profile(msg: Message):
         await msg.answer(str(e))
 
 
-# =========================
+# =====================================
 # SEARCH
-# =========================
+# =====================================
 
-@dp.message(F.text == "🔎 Поиск")
+@dp.message(F.text.startswith("🔎"))
 async def search(msg: Message):
 
     client = await get_client(msg.from_user.id)
@@ -708,15 +791,25 @@ async def search(msg: Message):
     if not client:
         return
 
+    query = msg.text.replace(
+        "🔎",
+        ""
+    ).strip()
+
+    if not query:
+        return await msg.answer(
+            "🔎 Введите ник после эмодзи"
+        )
+
     try:
 
-        users = client.search.users("a")
+        users = client.search.users(query)
 
-        text = "🔎 Результаты:\n\n"
+        text = "🔎 Результаты поиска\n\n"
 
         for u in users[:10]:
 
-            text += f"👤 {u.username}{badge(u.username)}\n"
+            text += f"👤 {u.username}{verify_mark(u.username)}\n"
 
         await msg.answer(text)
 
@@ -725,9 +818,9 @@ async def search(msg: Message):
         await msg.answer(str(e))
 
 
-# =========================
+# =====================================
 # POST
-# =========================
+# =====================================
 
 @dp.message(F.text == "📝 Пост")
 async def post_start(
@@ -772,9 +865,9 @@ async def post_send(
     await state.clear()
 
 
-# =========================
-# NOTIFICATIONS
-# =========================
+# =====================================
+# NOTIFS
+# =====================================
 
 @dp.message(F.text == "🔔 Уведомления")
 async def notifs(msg: Message):
@@ -795,64 +888,27 @@ async def notifs(msg: Message):
                 "🔔 Уведомлений нет"
             )
 
-        chunks = []
-
-        current = "🔔 Последние уведомления:\n\n"
+        text = "🔔 Последние уведомления\n\n"
 
         for n in notes:
 
-            actor = "unknown"
+            line = notif_text(n)
 
-            try:
-                actor = n.actor.username
-            except:
-                pass
+            if len(text + line) > 3500:
+                break
 
-            ntype = getattr(
-                n,
-                "type",
-                "notify"
-            )
+            text += f"{line}\n\n"
 
-            if ntype == "follow":
-
-                line = f"👤 {actor} подписался(-лась) на вас\n"
-
-            elif ntype == "like":
-
-                line = f"❤️ {actor} лайкнул(а) ваш пост\n"
-
-            elif ntype == "comment":
-
-                line = f"💬 {actor} прокомментировал(а) пост\n"
-
-            else:
-
-                line = f"🔔 {ntype} - {actor}\n"
-
-            if len(current + line) > 3500:
-
-                chunks.append(current)
-
-                current = ""
-
-            current += line
-
-        if current:
-            chunks.append(current)
-
-        for chunk in chunks:
-
-            await msg.answer(chunk)
+        await msg.answer(text)
 
     except Exception as e:
 
         await msg.answer(str(e))
 
 
-# =========================
+# =====================================
 # LOGOUT
-# =========================
+# =====================================
 
 @dp.message(F.text == "🚪 Выйти")
 async def logout(msg: Message):
@@ -866,14 +922,43 @@ async def logout(msg: Message):
     )
 
 
-# =========================
+# =====================================
+# RENDER HEALTHCHECK
+# =====================================
+
+async def health(request):
+    return web.Response(text="ITDGram OK")
+
+
+# =====================================
 # MAIN
-# =========================
+# =====================================
 
 async def main():
 
     await init_db()
 
+    app = web.Application()
+
+    app.router.add_get("/", health)
+
+    port = int(
+        os.getenv("PORT", 10000)
+    )
+
+    runner = web.AppRunner(app)
+
+    await runner.setup()
+
+    site = web.TCPSite(
+        runner,
+        host="0.0.0.0",
+        port=port
+    )
+
+    await site.start()
+
+    print(f"WEB STARTED {port}")
     print("BOT STARTED")
 
     await dp.start_polling(bot)
